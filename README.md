@@ -114,7 +114,4 @@ sudo reboot
 - [NVIDIA 빌드 설명](https://github.com/NVIDIA/open-gpu-kernel-modules/tree/580.173.02)
 - [Linux 모듈 서명](https://docs.kernel.org/admin-guide/module-signing.html)
 - [Ubuntu Secure Boot](https://documentation.ubuntu.com/security/security-features/platform-protections/secure-boot/)
-
-## 실험 코드
-
-기존 GPU 메모리 실험의 소스·재현 스크립트는 [experiments/README.md](experiments/README.md)를 참고한다. 커널의 기본 설정은 [linux-uma-swap/configs/spark.config](https://github.com/ohdh95/linux-uma-swap/blob/main/configs/spark.config)에 기록되어 있다.
+- [DGX Spark 커널 빌드 설정](https://github.com/ohdh95/linux-uma-swap/blob/main/configs/spark.config)
