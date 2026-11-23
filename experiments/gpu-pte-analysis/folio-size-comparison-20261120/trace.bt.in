@@ -1,0 +1,102 @@
+// Target: the local 7.0.0-1019-nvidia / 580.173.02 build, PAGE_SIZE=4096.
+// Phase 1: API allocation; phase 2: first writes and synchronization.
+uprobe:__BINARY__:folio_probe_begin /pid == cpid/
+{ @phase[pid] = 1; }
+
+uprobe:__BINARY__:folio_probe_allocated /pid == cpid/
+{ @base[pid] = arg0 & ~4095; @end[pid] = arg0 + arg1; @phase[pid] = 2; }
+
+uprobe:__BINARY__:folio_probe_touched /pid == cpid/
+{ delete(@phase[pid]); delete(@base[pid]); delete(@end[pid]); }
+
+// Exact successful anonymous folio allocations for faults inside malloc's
+// requested VA range. Failed high-order attempts are reported separately.
+kprobe:vma_alloc_folio_noprof
+/pid == cpid && (@phase[pid] == 1 ||
+ (@phase[pid] == 2 && arg3 >= @base[pid] && arg3 < @end[pid]))/
+{
+    @anon_pending[tid] = @phase[pid];
+    @anon_order[tid] = arg1; @anon_address[tid] = arg3;
+}
+
+kretprobe:vma_alloc_folio_noprof /pid == cpid && @anon_pending[tid]/
+{
+    if (retval && @anon_pending[tid] == 1) {
+        // The malloc pointer is not known until its return. Filter these
+        // low-volume rows against PROBE_RESULT's final allocation VA range.
+        @anon_alloc_phase[@anon_address[tid], @anon_order[tid]] = count();
+    } else if (retval) { @anon_folios[@anon_order[tid]] = count(); }
+    else { @anon_failed[@anon_order[tid]] = count(); }
+    delete(@anon_pending[tid]); delete(@anon_order[tid]); delete(@anon_address[tid]);
+}
+
+// RM OS backing requests, including status. NV_OK is zero. These requests
+// can include internal allocations; identify the test data by size/phase and
+// cross-check the Linux allocation histogram below, rather than summing all.
+kprobe:nv_alloc_pages /pid == cpid && @phase[pid]/
+{
+    @rm_active[tid] = 1;
+    @rm_phase[tid] = @phase[pid];
+    @rm_bytes[tid] = (uint64)arg1 * 4096;
+    @rm_block[tid] = arg2;
+    @rm_contig[tid] = arg3;
+}
+
+kretprobe:nv_alloc_pages /pid == cpid && @rm_active[tid]/
+{
+    @rm_requests[@rm_phase[tid], @rm_bytes[tid], @rm_block[tid],
+                 @rm_contig[tid], (uint64)retval] = count();
+    delete(@rm_active[tid]); delete(@rm_phase[tid]);
+    delete(@rm_bytes[tid]); delete(@rm_block[tid]); delete(@rm_contig[tid]);
+}
+
+kprobe:nv_alloc_system_pages /pid == cpid && @rm_active[tid]/
+{ @rm_leaf[tid] = 1; }
+kprobe:nv_alloc_contig_pages /pid == cpid && @rm_active[tid]/
+{ @rm_leaf[tid] = 2; }
+kretprobe:nv_alloc_system_pages,kretprobe:nv_alloc_contig_pages
+/pid == cpid && @rm_leaf[tid]/
+{ delete(@rm_leaf[tid]); }
+
+// Both wrappers are needed: alloc_pages() with CONFIG_NUMA bypasses
+// __alloc_pages_noprof(), whereas alloc_pages_node() passes through it.
+kprobe:alloc_pages_noprof,kprobe:__alloc_pages_noprof
+/pid == cpid && @rm_leaf[tid]/
+{
+    @alloc_depth[tid] = @alloc_depth[tid] + 1;
+    if (@alloc_depth[tid] == 1) { @alloc_order[tid] = arg1; }
+}
+
+kretprobe:alloc_pages_noprof,kretprobe:__alloc_pages_noprof
+/pid == cpid && @alloc_depth[tid]/
+{
+    if (@alloc_depth[tid] == 1) {
+        if (retval) {
+            @linux_rm_success[@rm_phase[tid], @rm_bytes[tid], @rm_block[tid],
+                              @rm_contig[tid], @rm_leaf[tid], @alloc_order[tid]] = count();
+        } else {
+            @linux_rm_failed[@rm_phase[tid], @rm_bytes[tid], @alloc_order[tid]] = count();
+        }
+        delete(@alloc_order[tid]);
+    }
+    @alloc_depth[tid] = @alloc_depth[tid] - 1;
+    if (@alloc_depth[tid] == 0) { delete(@alloc_depth[tid]); }
+}
+
+END
+{
+    printf("anon_folios key: allocation order; value: successful folio allocations\n");
+    print(@anon_folios); print(@anon_failed);
+    printf("anon_alloc_phase keys: fault VA, order; filter by final requested VA range\n");
+    print(@anon_alloc_phase);
+    printf("rm_requests keys: phase, total bytes, block bytes, contiguous, NV_STATUS\n");
+    print(@rm_requests);
+    printf("linux_rm_success keys: phase, RM total bytes, RM block bytes, contiguous, leaf(1=system/2=contiguous), order\n");
+    print(@linux_rm_success); print(@linux_rm_failed);
+    clear(@anon_folios); clear(@anon_failed); clear(@anon_alloc_phase); clear(@rm_requests);
+    clear(@linux_rm_success); clear(@linux_rm_failed);
+    clear(@phase); clear(@base); clear(@end);
+    clear(@anon_pending); clear(@anon_order); clear(@anon_address);
+    clear(@rm_active); clear(@rm_phase); clear(@rm_bytes); clear(@rm_block);
+    clear(@rm_contig); clear(@rm_leaf); clear(@alloc_depth); clear(@alloc_order);
+}
